@@ -3,7 +3,14 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { DecisionTraceView } from "@/components/chat/decision-trace";
-import { SESSION_MESSAGE_LIMIT, priorityLabels, statusLabels, type Ticket } from "@/lib/domain";
+import {
+  SESSION_MESSAGE_LIMIT,
+  affectedLabels,
+  priorityLabels,
+  statusLabels,
+  type ChatCard,
+  type Ticket,
+} from "@/lib/domain";
 import { formatClock } from "@/lib/format";
 import type { StoredMessage } from "@/server/conversations/service";
 
@@ -22,30 +29,145 @@ export function ChatPanel({
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
+  const [liveText, setLiveText] = useState("");
 
-  async function send(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!text.trim()) return;
+  async function sendText(value: string, action?: string) {
+    if (!value.trim()) return;
     setSending(true);
     setError(null);
+    setLiveText("");
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text: value, action }),
       });
-      const body = (await response.json()) as { error?: string };
-      if (!response.ok) {
-        setError(body.error ?? "Não foi possível enviar.");
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!contentType.includes("text/event-stream")) {
+        const body = (await response.json()) as { error?: string };
+        if (!response.ok) setError(body.error ?? "Não foi possível enviar.");
+        setText("");
+        router.refresh();
         return;
       }
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (reader) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
+        for (const event of events) {
+          const line = event.split("\n").find((item) => item.startsWith("data: "));
+          if (!line) continue;
+          const payload = JSON.parse(line.slice(6)) as { type: string; delta?: string; message?: string };
+          if (payload.type === "text" && payload.delta) setLiveText((current) => current + payload.delta);
+          if (payload.type === "error" && payload.message) setError(payload.message);
+        }
+      }
       setText("");
+      setLiveText("");
       router.refresh();
     } catch {
       setError("Não foi possível falar com o servidor.");
     } finally {
       setSending(false);
     }
+  }
+
+  function cardsOf(payload: unknown): ChatCard[] {
+  if (!payload || typeof payload !== "object" || !("cards" in payload)) return [];
+  const cards = (payload as { cards?: unknown }).cards;
+  return Array.isArray(cards) ? (cards as ChatCard[]) : [];
+}
+
+function MessageCards({
+  payload,
+  onChoose,
+  onDraft,
+}: {
+  payload: unknown;
+  onChoose: (label: string, action?: string) => void;
+  onDraft: (draftId: string, action: "confirmar" | "cancelar") => Promise<void>;
+}) {
+  const cards = cardsOf(payload);
+  if (cards.length === 0) return null;
+  return (
+    <div className="mt-3 space-y-3">
+      {cards.map((card, index) => {
+        if (card.kind === "draft") {
+          return (
+            <div key={card.draftId} className="rounded-md border border-rule bg-desk p-3 text-sm">
+              <p className="text-xs text-ink-3">Rascunho · aguardando confirmação</p>
+              <p className="mt-1 font-medium">{card.title}</p>
+              <p className="mt-1 text-ink-2">{card.description}</p>
+              <p className="mt-2 text-ink-3">
+                {card.category} · {priorityLabels[card.priority]} · {affectedLabels[card.affectedScope]} · {card.dueLabel}
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button type="button" className="rounded-md bg-cta px-3 py-2 text-white" onClick={() => void onDraft(card.draftId, "confirmar")}>
+                  Confirmar
+                </button>
+                <button type="button" className="rounded-md border border-rule px-3 py-2" onClick={() => void onDraft(card.draftId, "cancelar")}>
+                  Cancelar
+                </button>
+              </div>
+            </div>
+          );
+        }
+        if (card.kind === "selector") {
+          return (
+            <div key={`selector-${index}`} className="space-y-2">
+              {card.tickets.map((ticket) => (
+                <button
+                  key={ticket.id}
+                  type="button"
+                  className="block w-full rounded-md border border-rule px-3 py-2 text-left text-sm"
+                  onClick={() => onChoose(`${ticket.id} · ${ticket.title}`)}
+                >
+                  <span className="font-data text-xs text-ink-3">{ticket.id}</span>
+                  <span className="mt-1 block">{ticket.title}</span>
+                </button>
+              ))}
+            </div>
+          );
+        }
+        if (card.kind === "options") {
+          return (
+            <div key={`options-${index}`} className="flex flex-wrap gap-2">
+              {card.options.map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  className="rounded-full border border-rule px-3 py-2 text-sm"
+                  onClick={() => onChoose(option.label, option.id === "transfer" ? "transfer" : undefined)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          );
+        }
+        return (
+          <div key={card.ticket.id} className="rounded-md border border-rule bg-desk p-3 text-sm">
+            <p className="font-data text-xs text-ink-3">{card.ticket.id}</p>
+            <p className="font-medium">{card.ticket.title}</p>
+            <p className={card.overdue ? "text-danger-text" : "text-ink-3"}>
+              {statusLabels[card.ticket.status]} · {priorityLabels[card.ticket.priority]}
+              {card.overdue ? " · prazo vencido" : ""}
+            </p>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function send(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    void sendText(text);
   }
 
   return (
@@ -79,9 +201,37 @@ export function ChatPanel({
                 </p>
               ) : null}
               <p className="whitespace-pre-wrap">{message.text}</p>
+              <MessageCards
+                payload={message.payload}
+                onChoose={(label, action) => void sendText(label, action)}
+                onDraft={async (draftId, action) => {
+                  setSending(true);
+                  setError(null);
+                  try {
+                    const response = await fetch(`/api/drafts/${draftId}`, {
+                      method: "POST",
+                      headers: { "content-type": "application/json" },
+                      body: JSON.stringify({ action }),
+                    });
+                    const body = (await response.json()) as { error?: string };
+                    if (!response.ok) setError(body.error ?? "Não foi possível confirmar o rascunho.");
+                    router.refresh();
+                  } catch {
+                    setError("Não foi possível falar com o servidor.");
+                  } finally {
+                    setSending(false);
+                  }
+                }}
+              />
             </div>
           </article>
         ))}
+        {liveText ? (
+          <article className="max-w-2xl rounded-lg border border-rule bg-paper px-4 py-3">
+            <p className="mb-1 text-xs text-ink-3">Nexo Assist</p>
+            <p className="whitespace-pre-wrap">{liveText}</p>
+          </article>
+        ) : null}
         {tickets.length > 0 ? (
           <aside className="rounded-lg border border-rule bg-paper p-4">
             <h2 className="font-medium">Seus chamados</h2>
